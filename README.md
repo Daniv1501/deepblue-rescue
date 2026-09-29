@@ -9,10 +9,15 @@ rehabilitación de fauna marina.
 
 DeepBlue Rescue modela el recorrido completo de un caso de rescate — desde que un animal
 es admitido en un centro hasta que recibe tratamientos de especialistas — usando
-**Java 21**, **Spring Boot 4**, **Spring Data JPA / Hibernate**, **Flyway** y
+**Java 21**, **Spring Boot 4**, **Spring Data JPA / Hibernate**, **Flyway**, **MapStruct** y
 **PostgreSQL**, con pruebas de integración reales contra PostgreSQL mediante
-**Testcontainers**. El proyecto se centra exclusivamente en la capa de persistencia: no
-incluye controladores REST, servicios, DTOs, seguridad ni frontend.
+**Testcontainers** y pruebas unitarias de la capa de servicio con **Mockito**.
+
+El proyecto incluye la capa de persistencia (entidades, repositorios y migraciones) y una
+**capa de servicio** con las reglas de negocio, DTOs de entrada/salida (`record`) y mappers
+generados con MapStruct. Todavía **no incluye controladores REST**, seguridad ni frontend:
+los servicios se pueden usar desde otras capas o desde los tests, pero no están expuestos
+por HTTP.
 
 ## 3. Modelo de datos
 
@@ -81,9 +86,18 @@ exactamente con el esquema ya creado.
 mvn clean test
 ```
 
-No se requiere ninguna base de datos local: **Testcontainers** levanta automáticamente un
-contenedor Docker con PostgreSQL para la ejecución de las pruebas (ver sección 8). Solo se
-necesita tener **Docker** corriendo en la máquina.
+Hay dos tipos de pruebas:
+
+| Clase | Tipo | Qué valida |
+|---|---|---|
+| `PersistenceIntegrationTest` | Integración (Testcontainers + PostgreSQL) | Mapeo de entidades, relaciones, cascadas, restricciones del esquema y query methods / consultas JPQL |
+| `AnimalServiceImplTest` | Unitaria (Mockito) | Búsqueda por código, animales en rehabilitación y `canReceiveTreatment` según el estado del caso |
+| `RescueCaseServiceImplTest` | Unitaria (Mockito) | Búsqueda por código o estado y cambio de estado (transición válida e inválida) |
+| `TreatmentServiceImplTest` | Unitaria (Mockito) | Registro de tratamientos y cada una de las reglas de negocio que lo rechazan |
+
+Las pruebas unitarias no necesitan base de datos. Para las de integración no se requiere
+ninguna base local: **Testcontainers** levanta automáticamente un contenedor Docker con
+PostgreSQL (ver sección 8), así que solo se necesita tener **Docker** corriendo en la máquina.
 
 Para ver el contenedor mientras corren los tests:
 
@@ -150,6 +164,8 @@ static final PostgreSQLContainer<?> postgres =
 | `AnimalRepository` | `findByRescueCase_RescueCenter_Code(String centerCode)` | Animales pertenecientes a un centro (navegando dos relaciones) |
 | `ExpertiseRepository` | `findByNameIgnoreCase(String name)` | Buscar una expertise por nombre, sin distinguir mayúsculas/minúsculas |
 | `TreatmentRepository` | `findByAnimal_IdOrderByPerformedAtAsc(Long animalId)` | Tratamientos de un animal, ordenados cronológicamente |
+| `TreatmentRepository` | `findByAnimal_AnimalCodeOrderByPerformedAtAsc(String animalCode)` | Igual que el anterior, pero buscando por el código de negocio del animal (lo usa `TreatmentService.findByAnimalCode`) |
+| `SpecialistRepository` | `findByProfessionalCode(String professionalCode)` | Buscar un especialista por su código profesional (lo usa `TreatmentService.register`) |
 
 ## 10. Consultas JPQL implementadas (`@Query`)
 
@@ -159,6 +175,79 @@ static final PostgreSQLContainer<?> postgres =
 | `TreatmentRepository` | `findBetween(LocalDateTime start, LocalDateTime end)` | `select t from Treatment t where t.performedAt between :start and :end order by t.performedAt asc` | Tratamientos realizados dentro de un intervalo de fechas |
 | `TreatmentRepository` | `findByRescueCenterCode(String centerCode)` | `select t from Treatment t join t.animal a join a.rescueCase rescueCase join rescueCase.rescueCenter center where center.code = :centerCode` | Tratamientos de animales pertenecientes a un centro (recorre `Treatment → Animal → RescueCase → RescueCenter`) |
 | `TreatmentRepository` | `findBySpecialistExpertise(String expertiseName)` | `select distinct t from Treatment t join t.specialist specialist join specialist.expertiseAreas expertise where expertise.name = :expertiseName` | Tratamientos realizados por especialistas con determinada área de especialización (relación N:M, `DISTINCT` para evitar duplicados) |
+
+## 11. Capa de servicio
+
+Los servicios son interfaces en `service/` con su implementación en `service/impl/`. Las
+implementaciones están anotadas con `@Transactional(readOnly = true)` a nivel de clase, y
+los métodos que escriben (`changeStatus`, `register`) sobreescriben esa configuración con
+`@Transactional`. Los servicios nunca devuelven entidades: devuelven DTOs.
+
+| Servicio | Método | Propósito |
+|---|---|---|
+| `AnimalService` | `findByCode(animalCode)` | Obtener un animal por su código |
+| `AnimalService` | `findAnimalsInRehabilitation()` | Animales cuyo caso está en `IN_REHABILITATION` |
+| `AnimalService` | `canReceiveTreatment(animalCode)` | Indica si el animal puede recibir tratamientos según el estado de su caso |
+| `RescueCaseService` | `findByCode(caseCode)` | Obtener un caso por su código |
+| `RescueCaseService` | `findByStatus(status)` | Casos con determinado estado, ordenados por fecha ascendente |
+| `RescueCaseService` | `changeStatus(caseCode, request)` | Cambiar el estado de un caso validando la transición |
+| `TreatmentService` | `register(request)` | Registrar un tratamiento validando las reglas de negocio |
+| `TreatmentService` | `findByAnimalCode(animalCode)` | Tratamientos de un animal, en orden cronológico |
+
+### Reglas de negocio
+
+**Transiciones de estado de un caso** (`RescueCaseService.changeStatus`). Solo se permite
+avanzar un paso a la vez:
+
+```
+ADMITTED → UNDER_EVALUATION → IN_REHABILITATION → READY_FOR_RELEASE → RELEASED
+```
+
+Cualquier otra transición (saltarse un paso, retroceder, o salir de `RELEASED` / `CLOSED`)
+lanza `BusinessRuleException`. Si el caso no existe, lanza `ResourceNotFoundException`.
+
+**Registro de tratamientos** (`TreatmentService.register`). Se validan, en este orden:
+
+1. El animal debe existir (`ResourceNotFoundException`).
+2. El especialista debe existir (`ResourceNotFoundException`).
+3. El especialista debe estar activo (`BusinessRuleException`).
+4. El caso del animal no puede estar `RELEASED` ni `CLOSED` (`BusinessRuleException`).
+5. La fecha del tratamiento (`performedAt`) no puede ser anterior a la fecha del rescate
+   (`BusinessRuleException`).
+
+**Tratamientos permitidos según el estado** (`AnimalService.canReceiveTreatment`). Un animal
+solo puede recibir tratamientos cuando su caso está en `UNDER_EVALUATION` o
+`IN_REHABILITATION`.
+
+## 12. DTOs, mappers y excepciones
+
+**DTOs** (`dto/`, todos `record`):
+
+| DTO | Uso | Campos |
+|---|---|---|
+| `CreateTreatmentRequest` | Entrada de `TreatmentService.register` | `animalCode`, `specialistCode`, `performedAt`, `type`, `description` |
+| `ChangeRescueStatusRequest` | Entrada de `RescueCaseService.changeStatus` | `status` |
+| `AnimalResponse` | Salida | `id`, `animalCode`, `commonName`, `scientificName`, `sex`, `caseCode`, `rescueStatus` |
+| `RescueCaseResponse` | Salida | `id`, `caseCode`, `rescueDate`, `rescueLocation`, `status`, `centerCode`, `animalCode` |
+| `TreatmentResponse` | Salida | `id`, `animalCode`, `specialistCode`, `performedAt`, `type`, `description` |
+
+Los DTOs de salida exponen códigos de negocio (`caseCode`, `centerCode`, `animalCode`,
+`specialistCode`) en lugar de entidades relacionadas, para evitar acoplamiento y problemas
+de *lazy loading* fuera de la sesión de Hibernate.
+
+**Mappers** (`mapper/`): `AnimalMapper`, `RescueCaseMapper` y `TreatmentMapper` son
+interfaces de MapStruct con `componentModel = "spring"`. La implementación se genera en
+tiempo de compilación (el procesador está configurado en el `maven-compiler-plugin` del
+`pom.xml`).
+
+**Excepciones** (`exception/`):
+
+| Excepción | Cuándo se lanza |
+|---|---|
+| `ResourceNotFoundException` | El recurso solicitado no existe (por ejemplo, `Animal AN-999 does not exist.`) |
+| `BusinessRuleException` | El recurso existe, pero la operación viola una regla de negocio |
+
+Ambas extienden `RuntimeException`.
 
 ## Estructura del proyecto
 
@@ -170,11 +259,21 @@ deepblue-rescue/
 │   ├── java/com/deepblue/rescue
 │   │   ├── DeepBlueRescueApplication.java
 │   │   ├── domain/        (entidades JPA + enums)
-│   │   └── repository/    (interfaces JpaRepository)
+│   │   ├── repository/    (interfaces JpaRepository)
+│   │   ├── service/       (interfaces de servicio)
+│   │   │   └── impl/      (implementaciones con las reglas de negocio)
+│   │   ├── dto/
+│   │   │   ├── request/   (CreateTreatmentRequest, ChangeRescueStatusRequest)
+│   │   │   └── response/  (AnimalResponse, RescueCaseResponse, TreatmentResponse)
+│   │   ├── mapper/        (mappers MapStruct entidad → DTO)
+│   │   └── exception/     (ResourceNotFoundException, BusinessRuleException)
 │   └── resources
 │       ├── application.yml
 │       └── db/migration   (V1, V2, V3)
-└── src/test
-    └── java/com/deepblue/rescue
-        └── PersistenceIntegrationTest.java
+└── src/test/java/com/deepblue/rescue
+    ├── PersistenceIntegrationTest.java
+    └── service
+        ├── AnimalServiceImplTest.java
+        ├── RescueCaseServiceImplTest.java
+        └── TreatmentServiceImplTest.java
 ```

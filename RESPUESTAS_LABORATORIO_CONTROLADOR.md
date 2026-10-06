@@ -1,3 +1,5 @@
+Daniel Varela
+
 # DeepBlue Rescue — Respuestas del laboratorio de la capa Controlador
 
 ## 1. Qué se implementó

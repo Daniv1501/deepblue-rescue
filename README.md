@@ -11,8 +11,9 @@ DeepBlue Rescue modela el recorrido completo de un caso de rescate — desde que
 es admitido en un centro hasta que recibe tratamientos de especialistas — usando
 **Java 21**, **Spring Boot 4**, **Spring Data JPA / Hibernate**, **Flyway** y
 **PostgreSQL**, con pruebas de integración reales contra PostgreSQL mediante
-**Testcontainers**. El proyecto se centra exclusivamente en la capa de persistencia: no
-incluye controladores REST, servicios, DTOs, seguridad ni frontend.
+**Testcontainers**. Incluye también la capa de servicio y la capa de controladores REST
+(`/api/rescue-cases`, `/api/animals`, `/api/treatments`) con un contrato de error común
+(`ErrorResponse`). Ver `RESPUESTAS_LABORATORIO_CONTROLADOR.md`.
 
 ## 3. Modelo de datos
 

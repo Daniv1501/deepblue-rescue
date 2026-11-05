@@ -51,7 +51,7 @@ class PersistenceIntegrationTest {
     private AnimalRepository animalRepository;
 
     @Autowired
-    private MedicalRecordRepository medicalRecordRepository;
+    private MedicalRecordRepository medidicalRecordRepository;
 
     @Autowired
     private SpecialistRepository specialistRepository;
